@@ -3923,6 +3923,16 @@ static SHIFT_DURING_RIGHT_DRAG: AtomicBool = AtomicBool::new(false);
 static RIGHT_DRAG_LATCH_SINCE: AtomicI64 = AtomicI64::new(0);
 static ENGINE_OWNS_LOCK: AtomicBool = AtomicBool::new(false);
 
+fn engine_owns_lock(
+    toplevel: bool,
+    engine_wants: bool,
+    dragging: bool,
+    wanted_before_drag: bool,
+    shift_during_drag: bool,
+) -> bool {
+    toplevel && engine_wants && (!dragging || wanted_before_drag || shift_during_drag)
+}
+
 
 /// `CORDIAL_NO_POINTER_LOCK=1` — never capture the pointer, whatever the engine
 /// or the mouse buttons say.
@@ -4468,10 +4478,13 @@ impl WaylandWindow {
         // duplicating a decision the engine had already made correctly.
         let want = asked;
         if want {
-            let owned = engine_wants
-                && (!dragging
-                    || LOCK_WANTED_BEFORE_RIGHT_DRAG.load(Ordering::Acquire)
-                    || SHIFT_DURING_RIGHT_DRAG.load(Ordering::Acquire));
+            let owned = engine_owns_lock(
+                Self::constrain_toplevel(),
+                engine_wants,
+                dragging,
+                LOCK_WANTED_BEFORE_RIGHT_DRAG.load(Ordering::Acquire),
+                SHIFT_DURING_RIGHT_DRAG.load(Ordering::Acquire),
+            );
             ENGINE_OWNS_LOCK.store(owned, Ordering::Release);
             if owned && POINTER_LOCK_ACTIVE.load(Ordering::Acquire) {
                 let (cx, cy) = self.canvas_centre();
@@ -4650,12 +4663,8 @@ fn constrain_toplevel() -> bool {
         let (x, y) = if centre {
             let (cx, cy) = self.canvas_centre();
             self.set_pointer_position(cx, cy);
-            if Self::constrain_toplevel() {
-                let (ox, oy) = *self.placed_at.lock().unwrap_or_else(|e| e.into_inner());
-                (cx + ox as f32, cy + oy as f32)
-            } else {
-                (cx, cy)
-            }
+            let (ox, oy) = *self.placed_at.lock().unwrap_or_else(|e| e.into_inner());
+            (cx + ox as f32, cy + oy as f32)
         } else {
             self.pointer_position()
         };
@@ -4674,8 +4683,7 @@ fn constrain_toplevel() -> bool {
                 f32_to_fixed(y),
             );
             if centre {
-                let target = if Self::constrain_toplevel() { self.parent_surface } else { self.surface };
-                (self.wl.marshal_flags)(target, WL_SURFACE_COMMIT, std::ptr::null(), 1, 0);
+                (self.wl.marshal_flags)(self.parent_surface, WL_SURFACE_COMMIT, std::ptr::null(), 1, 0);
             }
             (self.wl.marshal_flags)(
                 *slot,
@@ -6524,6 +6532,20 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_toplevel_lock_is_ever_owned_by_the_engine() {
+        for bits in 0..16u8 {
+            let (wants, dragging, before, shift) =
+                (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+            assert!(!engine_owns_lock(false, wants, dragging, before, shift));
+        }
+        assert!(engine_owns_lock(true, true, false, false, false));
+        assert!(!engine_owns_lock(true, false, false, false, false));
+        assert!(!engine_owns_lock(true, true, true, false, false));
+        assert!(engine_owns_lock(true, true, true, true, false));
+        assert!(engine_owns_lock(true, true, true, false, true));
+    }
 
     #[test]
     fn pointer_positions_and_side_buttons_keep_their_meaning() {
