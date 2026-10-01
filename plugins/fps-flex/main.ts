@@ -157,7 +157,7 @@ if (wanted && MODES.includes(wanted)) {
 // file spent its entire shipped life collecting that refusal without reporting
 // it, because it never checked.
 const CAPS = ["240", "165", "144", "120", "60", "default"];
-const DEFAULT_CAP = "240";
+const DEFAULT_CAP = "default";
 
 let cap = DEFAULT_CAP;
 const wantedCap = typeof answers.cap === "string" ? answers.cap.trim().toLowerCase() : "";

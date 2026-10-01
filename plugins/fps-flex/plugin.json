@@ -29,7 +29,7 @@
       "title": "Frame rate cap",
       "description": "The highest frame rate Roblox will render. Roblox stops at 60 on its own; pick your monitor's refresh rate to match it.",
       "type": "choice",
-      "default": "240",
+      "default": "default",
       "options": [
         { "value": "240", "label": "240 (maximum)" },
         { "value": "165", "label": "165" },
