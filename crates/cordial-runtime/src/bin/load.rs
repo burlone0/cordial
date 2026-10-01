@@ -181,6 +181,11 @@ env:
                                      texture-format-query-observability.md. Off
                                      by default; never changes what a shipped
                                      client tells the engine
+  CORDIAL_NO_ETC_EMULATION=1         on a GPU without native ETC2 (NVIDIA), stop
+                                     reporting ETC2/EAC and decoding it on the
+                                     CPU; the engine then sees ETC1 0 ETC2 0.
+                                     The control for docs/adr/ADR-048-etc2-is-
+                                     emulated-where-the-driver-lacks-it.md
   CORDIAL_FORCE_GPU_VENDOR=0x10de[@550.163.01]
                                      behave as though the GPU were NVIDIA's (or
                                      as another vendor id) for the code that is
@@ -819,7 +824,10 @@ extern "C" fn run_bootstrap() {
             "",
             "",
         ) } {
-            Ok(code) => println!("    nativeInitClientSettings -> {code}"),
+            Ok(code) => {
+                println!("    nativeInitClientSettings -> {code}");
+                cordial_runtime::client_settings::arm_redelivery(plan.settings_native, &plan.settings);
+            }
             Err(e) => println!("    nativeInitClientSettings failed: {e}"),
         }
         // The delivery attempt is over, one way or the other -- this is the

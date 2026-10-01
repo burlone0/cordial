@@ -64,7 +64,9 @@
 //! it had not actually been shown until the two were separated.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Roblox's settings CDN, application name `AndroidApp` -- not a guess,
 /// `AndroidClient`, `AndroidPlayer`, `AndroidClientSettings` and
@@ -449,15 +451,96 @@ fn apply_overrides(doc: String) -> String {
         .map(|(k, r)| (k.clone(), serde_json::Value::String(r.value.clone())))
         .collect();
 
+    let dynamic = has_dynamic_override(&resolved);
     match merge(&doc, overrides) {
         Ok((merged, _)) => {
             crate::flags::report(&resolved);
+            DYNAMIC_OVERRIDES.store(dynamic, Ordering::Relaxed);
             merged
         }
         Err(why) => {
             println!("  flags: {why}; ignoring overrides");
             doc
         }
+    }
+}
+
+fn has_dynamic_override(resolved: &std::collections::BTreeMap<String, crate::flags::Resolved>) -> bool {
+    resolved
+        .iter()
+        .any(|(k, r)| is_roblox_flag(k) && k.starts_with("DF") && r.source != crate::flags::Source::Builtin)
+}
+
+static DYNAMIC_OVERRIDES: AtomicBool = AtomicBool::new(false);
+
+const REDELIVERY_SETTLE: Duration = Duration::from_millis(500);
+
+struct Redelivery {
+    native: usize,
+    document: std::sync::Arc<String>,
+    last_reload: Option<Instant>,
+    waiting: bool,
+}
+
+static REDELIVERY: Mutex<Option<Redelivery>> = Mutex::new(None);
+
+fn redelivery_disabled() -> bool {
+    std::env::var_os("CORDIAL_NO_FLAG_REDELIVERY").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+pub fn arm_redelivery(native: usize, document: &str) {
+    if native == 0 || document.is_empty() || !DYNAMIC_OVERRIDES.load(Ordering::Relaxed) {
+        return;
+    }
+    if redelivery_disabled() {
+        println!(
+            "  flags: CORDIAL_NO_FLAG_REDELIVERY is set; DF* overrides will revert at the engine's first flag reload"
+        );
+        return;
+    }
+    *REDELIVERY.lock().unwrap_or_else(|e| e.into_inner()) = Some(Redelivery {
+        native,
+        document: std::sync::Arc::new(document.to_owned()),
+        last_reload: None,
+        waiting: false,
+    });
+}
+
+pub fn engine_reloaded_flags() {
+    let mut guard = REDELIVERY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(r) = guard.as_mut() else { return };
+    r.last_reload = Some(Instant::now());
+    if r.waiting {
+        return;
+    }
+    r.waiting = true;
+    drop(guard);
+    std::thread::spawn(redeliver_when_settled);
+}
+
+fn redeliver_when_settled() {
+    let (native, document) = loop {
+        let mut guard = REDELIVERY.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(r) = guard.as_mut() else { return };
+        let since = r.last_reload.map_or(REDELIVERY_SETTLE, |t| t.elapsed());
+        if since >= REDELIVERY_SETTLE {
+            r.waiting = false;
+            break (r.native, std::sync::Arc::clone(&r.document));
+        }
+        drop(guard);
+        std::thread::sleep(REDELIVERY_SETTLE - since);
+    };
+    let result = unsafe {
+        cordial_linker_sys::game_activity::init_client_settings(
+            native as *mut std::ffi::c_void,
+            &document,
+            "",
+            "",
+        )
+    };
+    match result {
+        Ok(_) => {}
+        Err(e) => println!("[cordial] flags: re-applying overrides after the engine's flag reload failed: {e}"),
     }
 }
 

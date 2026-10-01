@@ -87,6 +87,7 @@ pub enum Event {
     /// Passed through rather than parsed here so that this module stays "what
     /// the log said" and the protocol stays in the module that documents it.
     Rpc(String),
+    FlagsReloaded,
 }
 
 /// One log line, or `None` if it is not one of the four.
@@ -98,6 +99,9 @@ pub enum Event {
 pub fn parse_line(line: &str) -> Option<Event> {
     if line.contains(crate::bloxstrap_rpc::MARKER) {
         return Some(Event::Rpc(line.to_owned()));
+    }
+    if line.contains("[FLog::DynamicFastVariableReloader]") {
+        return Some(Event::FlagsReloaded);
     }
     if line.contains("[FLog::SingleSurfaceApp] leaveUGCGameInternal") {
         return Some(Event::Left);
@@ -569,6 +573,7 @@ pub fn poll() {
                     crate::android::looper::request_quit();
                 }
             }
+            Event::FlagsReloaded => crate::client_settings::engine_reloaded_flags(),
             Event::Rpc(line) => match crate::bloxstrap_rpc::parse_line(&line) {
                 // **This is the first caller `bloxstrap_rpc` has ever had.**
                 // Everything below the parse is still unwired: the presence
@@ -733,6 +738,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_engines_flag_reload_is_recognised() {
+        for line in [
+            "2026-09-30T22:33:02.260Z,120,260689,61bfb6c0,6,Info [FLog::DynamicFastVariableReloader] \
+             DynamicFastVariableReloader finished flag fetch. Tombstone status: valid",
+            "[FLog::DynamicFastVariableReloader] Skipping flag cache write: server channel differs \
+             from current session channel, preserving prefetched cache",
+        ] {
+            assert_eq!(parse_line(line), Some(Event::FlagsReloaded), "{line}");
+        }
+        let unrelated = "2026-09-30T22:33:02.260Z,120,260666,61bfb6c0,6,Info [FLog::TombstoneCache] \
+             [FlagCache] Tombstone 1, expiry time 360, holdout false, channel 'production'";
+        assert_eq!(parse_line(unrelated), None);
+    }
+
     /// Ordinary log traffic must not look like anything.
     #[test]
     fn an_uninteresting_line_is_uninteresting() {
@@ -832,6 +852,7 @@ mod tests {
                     println!("leave");
                 }
                 Some(Event::Rpc(_)) => rpc += 1,
+                Some(Event::FlagsReloaded) => println!("flag reload"),
                 None => {}
             }
         }
