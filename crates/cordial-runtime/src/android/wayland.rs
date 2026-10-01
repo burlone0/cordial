@@ -3223,6 +3223,10 @@ impl WaylandWindow {
         unpack_pointer_position(self.pointer_pos.load(Ordering::Acquire))
     }
 
+    fn stacking_gate_waiting(&self) -> bool {
+        self.stacking_gate.lock().unwrap_or_else(|e| e.into_inner()).is_arming()
+    }
+
     fn canvas_centre(&self) -> (f32, f32) {
         let (w, h, _) = self.geometry();
         (w as f32 / 2.0, h as f32 / 2.0)
@@ -4499,7 +4503,13 @@ impl WaylandWindow {
                 self.lock_pointer();
             }
         } else if !want && held {
-            self.release_pointer();
+            if ENGINE_OWNS_LOCK.load(Ordering::Acquire) && self.stacking_gate_waiting() {
+                if super::input::trace_mouse() {
+                    eprintln!("[cordial] pointer lock: release deferred, the stacking gate is waiting for a GTK frame");
+                }
+            } else {
+                self.release_pointer();
+            }
         } else if want && held && self.lock_went_dead() {
             // **A lock the compositor switched off and never switched back
             // on.** `locked_pointer_unlocked` deliberately keeps the object
@@ -4660,6 +4670,7 @@ fn constrain_toplevel() -> bool {
             return;
         }
         let centre = ENGINE_OWNS_LOCK.swap(false, Ordering::AcqRel);
+        let commit = centre && !self.stacking_gate_waiting();
         let (x, y) = if centre {
             let (cx, cy) = self.canvas_centre();
             self.set_pointer_position(cx, cy);
@@ -4682,7 +4693,7 @@ fn constrain_toplevel() -> bool {
                 f32_to_fixed(x),
                 f32_to_fixed(y),
             );
-            if centre {
+            if commit {
                 (self.wl.marshal_flags)(self.parent_surface, WL_SURFACE_COMMIT, std::ptr::null(), 1, 0);
             }
             (self.wl.marshal_flags)(
@@ -4706,7 +4717,11 @@ fn constrain_toplevel() -> bool {
         super::input::reset_mouse_delta();
         super::input::forget_pending_unlocked_delta();
         if super::input::trace_mouse() {
-            let how = if centre { " (canvas centre, committed)" } else { "" };
+            let how = match (centre, commit) {
+                (true, true) => " (canvas centre, committed)",
+                (true, false) => " (canvas centre, not committed: stacking gate waiting)",
+                _ => "",
+            };
             eprintln!("[cordial] pointer lock: released, cursor hinted to ({x}, {y}){how}");
         }
     }
