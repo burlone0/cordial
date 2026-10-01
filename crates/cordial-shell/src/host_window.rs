@@ -2332,6 +2332,9 @@ fn input_region(
     // also exactly what `wayland::dialog_in_front` already enforces on the
     // forwarding side. Claiming the whole surface says the same thing to the
     // compositor.
+    // A KWin pointer lock over the raised canvas claims it too
+    // (`claims_whole_window`), because the toplevel lock only activates where
+    // the toplevel takes pointer input.
     //
     // **The other way round was tried first and was much worse.** 07564e2 gave
     // the *canvas* an empty input region instead, which does not hand the click

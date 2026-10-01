@@ -3925,6 +3925,9 @@ static SHIFT_DURING_RIGHT_DRAG: AtomicBool = AtomicBool::new(false);
 /// would kill the camera for good with nothing on screen to explain it,
 /// which is the same shape as the Escape latch this release just removed.
 static RIGHT_DRAG_LATCH_SINCE: AtomicI64 = AtomicI64::new(0);
+/// The current lock is the engine's own (first person, shift lock) rather than
+/// a right drag. On KWin only, it pins the engine's cursor to the canvas centre
+/// while locked and releases the pointer there.
 static ENGINE_OWNS_LOCK: AtomicBool = AtomicBool::new(false);
 
 fn engine_owns_lock(
@@ -4560,7 +4563,9 @@ impl WaylandWindow {
 
 /// Whether to constrain the GTK toplevel rather than the engine's subsurface.
 ///
-/// KWin only, and only because of KDE bug 463088 -- see `lock_pointer`. On
+/// KWin only, because of KDE bug 463088 -- see `lock_pointer`. On KWin it also
+/// keeps the raised canvas in the toplevel's input region, so the lock can
+/// activate, and centres engine-owned locks. On
 /// every other compositor the subsurface is the surface that actually holds
 /// pointer focus over the canvas, and constraining anything else is a lock that
 /// is granted and never activates.
@@ -4599,7 +4604,9 @@ fn constrain_toplevel() -> bool {
         // a constraint made against a subsurface and, on affected versions,
         // still lets the physical cursor leave it (KDE bug 463088). Native game
         // windows such as Sober's SDL3 window constrain their xdg_toplevel and
-        // do not hit that path.
+        // do not hit that path. That lock only activates where the toplevel
+        // takes pointer input, so on KWin the raised canvas is kept in the
+        // toplevel's input region (`set_canvas_in_input_region`).
         //
         // So the two halves of 3d67e59 are separated, because only one of them
         // was ever about the surface. Using **GDK's** pointer rather than
@@ -4663,6 +4670,10 @@ fn constrain_toplevel() -> bool {
     /// Without it the cursor reappears wherever it was when the lock was taken,
     /// which after a long camera drag is not where the person looking at the
     /// screen thinks it is.
+    ///
+    /// On KWin an engine-owned lock is released at the canvas centre instead,
+    /// with a commit on the toplevel that is held back while the stacking gate
+    /// waits for a GTK frame.
     fn release_pointer(&self) {
         POINTER_LOCK_REQUESTED.store(false, Ordering::Release);
         let mut slot = self.locked_pointer.lock().unwrap_or_else(|e| e.into_inner());
