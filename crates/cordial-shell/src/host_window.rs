@@ -2289,6 +2289,10 @@ impl HostWindow {
     }
 }
 
+fn claims_whole_window(dialog_up: bool, canvas_in_input_region: bool, see_through: bool) -> bool {
+    dialog_up || (canvas_in_input_region && !see_through)
+}
+
 /// The parent surface's input region: everything except the canvas, plus the
 /// editor's rectangle handed back.
 ///
@@ -2304,10 +2308,6 @@ impl HostWindow {
 /// `surface` is the whole surface including any CSD shadow, and is widened to
 /// cover the content if a configure has left it briefly smaller -- a region
 /// that does not reach the canvas would clip the hole rather than the chrome.
-fn claims_whole_window(dialog_up: bool, canvas_in_input_region: bool, see_through: bool) -> bool {
-    dialog_up || (canvas_in_input_region && !see_through)
-}
-
 fn input_region(
     surface: (i32, i32),
     content: (i32, i32, i32, i32),
