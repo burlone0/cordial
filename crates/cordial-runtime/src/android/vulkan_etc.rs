@@ -8,6 +8,7 @@ use super::glcount;
 
 const VK_SUCCESS: i32 = 0;
 const VK_ERROR_INITIALIZATION_FAILED: i32 = -3;
+const VK_ERROR_FEATURE_NOT_PRESENT: i32 = -8;
 const VK_ERROR_FORMAT_NOT_SUPPORTED: i32 = -11;
 
 const ST_BUFFER_CREATE_INFO: u32 = 12;
@@ -43,12 +44,23 @@ const MEMORY_HOST_VISIBLE: u32 = 0x2;
 const MEMORY_HOST_COHERENT: u32 = 0x4;
 const WHOLE_SIZE: u64 = u64::MAX;
 
-const STAGING_CHUNK: u64 = 8 << 20;
+const STAGING_FIRST: u64 = 256 << 10;
+const STAGING_CAP: u64 = 2 << 20;
+const STAGING_GRANULE: u64 = 64 << 10;
 const STAGING_ALIGN: u64 = 16;
+
+fn env_on(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| v != "0")
+}
 
 pub fn disabled() -> bool {
     static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("CORDIAL_NO_ETC_EMULATION").is_some_and(|v| v != "0"))
+    *OFF.get_or_init(|| env_on("CORDIAL_NO_ETC_EMULATION"))
+}
+
+fn forced() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_on("CORDIAL_FORCE_ETC_EMULATION"))
 }
 
 fn trace(args: std::fmt::Arguments<'_>) {
@@ -58,6 +70,11 @@ fn trace(args: std::fmt::Arguments<'_>) {
 fn unhandled(args: std::fmt::Arguments<'_>) {
     glcount::ETC_UNHANDLED.fetch_add(1, Relaxed);
     trace(format_args!("UNHANDLED {args}"));
+}
+
+fn refused(args: std::fmt::Arguments<'_>) {
+    glcount::ETC_UNHANDLED.fetch_add(1, Relaxed);
+    eprintln!("[vulkan-etc] REFUSED {args}");
 }
 
 pub fn etc_format(format: u32) -> Option<(EtcFormat, u32, &'static str)> {
@@ -117,7 +134,11 @@ slots!(
     H_FORMAT_PROPS2,
     H_IMAGE_FORMAT_PROPS,
     H_IMAGE_FORMAT_PROPS2,
+    H_SPARSE_FORMAT_PROPS,
+    H_SPARSE_FORMAT_PROPS2,
     H_CREATE_IMAGE,
+    H_DEVICE_IMAGE_MEM_REQS,
+    H_DEVICE_IMAGE_SPARSE_MEM_REQS,
     H_DESTROY_IMAGE,
     H_CREATE_IMAGE_VIEW,
     H_CMD_COPY_BUFFER_TO_IMAGE,
@@ -146,11 +167,70 @@ slots!(
     H_DESTROY_DEVICE,
 );
 
-pub fn hook(name: &[u8], host: *mut c_void) -> Option<*mut c_void> {
-    if host.is_null() || (disabled() && !crate::android::tracing()) {
+pub fn hook(device: Option<*mut c_void>, name: &[u8], host: *mut c_void) -> Option<*mut c_void> {
+    if host.is_null() {
         return None;
     }
-    let (slot, ours): (&AtomicUsize, *const ()) = match name {
+    if let Some((slot, ours)) = physical_device_hook(name) {
+        if disabled() && !crate::android::tracing() {
+            return None;
+        }
+        slot.store(host as usize, Relaxed);
+        return Some(ours as *mut c_void);
+    }
+    let (slot, ours) = device_hook(name)?;
+    let shown = String::from_utf8_lossy(name);
+    let refuse = match device {
+        _ if disabled() => Some("CORDIAL_NO_ETC_EMULATION is set"),
+        Some(d) if active_device(d as usize).is_none() => Some("device is not emulating"),
+        None if !instance_may_emulate() => Some("no physical device of this instance is emulated"),
+        _ => None,
+    };
+    let route = match device {
+        Some(d) => format!("vkGetDeviceProcAddr({d:p})"),
+        None => "vkGetInstanceProcAddr".to_string(),
+    };
+    if let Some(why) = refuse {
+        trace(format_args!("{shown} via {route}: host entry point returned untouched, {why}"));
+        return None;
+    }
+    slot.store(host as usize, Relaxed);
+    trace(format_args!("{shown} via {route}: hooked"));
+    Some(ours as *mut c_void)
+}
+
+fn instance_may_emulate() -> bool {
+    static SEEN: Mutex<Option<(usize, bool)>> = Mutex::new(None);
+    let instance = super::vulkan::instance();
+    if instance.is_null() {
+        return false;
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((i, e)) = *seen {
+        if i == instance as usize {
+            return e;
+        }
+    }
+    let Some(enumerate) = as_fn::<extern "C" fn(*mut c_void, *mut u32, *mut *mut c_void) -> i32>(
+        super::vulkan::host_instance_proc(c"vkEnumeratePhysicalDevices") as usize,
+    ) else {
+        return false;
+    };
+    let mut count = 0u32;
+    if enumerate(instance, &mut count, std::ptr::null_mut()) < 0 {
+        return false;
+    }
+    let mut pds = vec![std::ptr::null_mut(); count as usize];
+    if enumerate(instance, &mut count, pds.as_mut_ptr()) < 0 {
+        return false;
+    }
+    let any = pds.iter().take(count as usize).any(|&pd| emulate_for(pd));
+    *seen = Some((instance as usize, any));
+    any
+}
+
+fn physical_device_hook(name: &[u8]) -> Option<(&'static AtomicUsize, *const ())> {
+    Some(match name {
         b"vkGetPhysicalDeviceFeatures" => (&H_FEATURES, get_features as *const ()),
         b"vkGetPhysicalDeviceFeatures2" | b"vkGetPhysicalDeviceFeatures2KHR" => {
             (&H_FEATURES2, get_features2 as *const ())
@@ -164,7 +244,26 @@ pub fn hook(name: &[u8], host: *mut c_void) -> Option<*mut c_void> {
         b"vkGetPhysicalDeviceImageFormatProperties2" | b"vkGetPhysicalDeviceImageFormatProperties2KHR" => {
             (&H_IMAGE_FORMAT_PROPS2, get_image_format_props2 as *const ())
         }
+        b"vkGetPhysicalDeviceSparseImageFormatProperties" => {
+            (&H_SPARSE_FORMAT_PROPS, get_sparse_format_props as *const ())
+        }
+        b"vkGetPhysicalDeviceSparseImageFormatProperties2"
+        | b"vkGetPhysicalDeviceSparseImageFormatProperties2KHR" => {
+            (&H_SPARSE_FORMAT_PROPS2, get_sparse_format_props2 as *const ())
+        }
+        _ => return None,
+    })
+}
+
+fn device_hook(name: &[u8]) -> Option<(&'static AtomicUsize, *const ())> {
+    Some(match name {
         b"vkCreateImage" => (&H_CREATE_IMAGE, create_image as *const ()),
+        b"vkGetDeviceImageMemoryRequirements" | b"vkGetDeviceImageMemoryRequirementsKHR" => {
+            (&H_DEVICE_IMAGE_MEM_REQS, device_image_memory_requirements as *const ())
+        }
+        b"vkGetDeviceImageSparseMemoryRequirements" | b"vkGetDeviceImageSparseMemoryRequirementsKHR" => {
+            (&H_DEVICE_IMAGE_SPARSE_MEM_REQS, device_image_sparse_memory_requirements as *const ())
+        }
         b"vkDestroyImage" => (&H_DESTROY_IMAGE, destroy_image as *const ()),
         b"vkCreateImageView" => (&H_CREATE_IMAGE_VIEW, create_image_view as *const ()),
         b"vkCmdCopyBufferToImage" => (&H_CMD_COPY_BUFFER_TO_IMAGE, cmd_copy_buffer_to_image as *const ()),
@@ -198,9 +297,7 @@ pub fn hook(name: &[u8], host: *mut c_void) -> Option<*mut c_void> {
         b"vkDestroyCommandPool" => (&H_DESTROY_COMMAND_POOL, destroy_command_pool as *const ()),
         b"vkDestroyDevice" => (&H_DESTROY_DEVICE, destroy_device as *const ()),
         _ => return None,
-    };
-    slot.store(host as usize, Relaxed);
-    Some(ours as *mut c_void)
+    })
 }
 
 fn host_features(pd: *mut c_void) -> Option<[u32; FEATURE_COUNT]> {
@@ -222,13 +319,18 @@ pub fn emulate_for(pd: *mut c_void) -> bool {
     }
     let emulate = match host_features(pd) {
         Some(f) => {
-            let e = f[FEATURE_ETC2] == 0;
+            let native = f[FEATURE_ETC2] != 0;
+            let e = !native || forced();
             trace(format_args!(
                 "physical device {pd:p}: host textureCompressionETC2={} ASTC_LDR={} BC={}; {}",
                 f[FEATURE_ETC2],
                 f[FEATURE_ASTC_LDR],
                 f[FEATURE_BC],
-                if e { "ETC2/EAC will be emulated" } else { "native ETC2, emulation off" }
+                match (native, e) {
+                    (false, _) => "ETC2/EAC will be emulated",
+                    (true, true) => "native ETC2, emulated anyway because CORDIAL_FORCE_ETC_EMULATION is set",
+                    (true, false) => "native ETC2, emulation off",
+                }
             ));
             e
         }
@@ -416,6 +518,47 @@ extern "C" fn get_image_format_props2(pd: *mut c_void, info: *const c_void, out:
     rc
 }
 
+type SparseFormatPropsFn = extern "C" fn(*mut c_void, u32, u32, u32, u32, u32, *mut u32, *mut c_void);
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn get_sparse_format_props(
+    pd: *mut c_void,
+    format: u32,
+    kind: u32,
+    samples: u32,
+    usage: u32,
+    tiling: u32,
+    count: *mut u32,
+    out: *mut c_void,
+) {
+    let Some(f) = as_fn::<SparseFormatPropsFn>(H_SPARSE_FORMAT_PROPS.load(Relaxed)) else {
+        return;
+    };
+    match etc_format(format) {
+        Some((_, _, name)) if emulate_for(pd) && !count.is_null() => {
+            wr::<u32>(count as *mut c_void, 0, 0);
+            trace(format_args!("vkGetPhysicalDeviceSparseImageFormatProperties({name}): EMULATED, no sparse support"));
+        }
+        _ => f(pd, format, kind, samples, usage, tiling, count, out),
+    }
+}
+
+extern "C" fn get_sparse_format_props2(pd: *mut c_void, info: *const c_void, count: *mut u32, out: *mut c_void) {
+    let Some(f) = as_fn::<extern "C" fn(*mut c_void, *const c_void, *mut u32, *mut c_void)>(
+        H_SPARSE_FORMAT_PROPS2.load(Relaxed),
+    ) else {
+        return;
+    };
+    let etc = if info.is_null() { None } else { etc_format(rd(info, 16)) };
+    match etc {
+        Some((_, _, name)) if emulate_for(pd) && !count.is_null() => {
+            wr::<u32>(count as *mut c_void, 0, 0);
+            trace(format_args!("vkGetPhysicalDeviceSparseImageFormatProperties2({name}): EMULATED, no sparse support"));
+        }
+        _ => f(pd, info, count, out),
+    }
+}
+
 #[repr(C)]
 pub struct StrippedDeviceInfo {
     info: [u8; 72],
@@ -429,9 +572,9 @@ impl StrippedDeviceInfo {
     }
 }
 
-pub fn strip_device_features(pd: *mut c_void, info: *const c_void) -> Option<Box<StrippedDeviceInfo>> {
+pub fn strip_device_features(pd: *mut c_void, info: *const c_void) -> Result<Option<Box<StrippedDeviceInfo>>, i32> {
     if info.is_null() {
-        return None;
+        return Ok(None);
     }
     let enabled: *const c_void = rd(info, 64);
     let head: *const c_void = rd(info, 8);
@@ -449,7 +592,13 @@ pub fn strip_device_features(pd: *mut c_void, info: *const c_void) -> Option<Box
         if emulate { "on" } else { "off" },
     ));
     if !emulate || !(via_features || via_features2) {
-        return None;
+        return Ok(None);
+    }
+    if via_features2 && f2 != head {
+        refused(format_args!(
+            "vkCreateDevice: textureCompressionETC2 is requested in a VkPhysicalDeviceFeatures2 that is not the first pNext node, which this shim cannot rewrite; failing with VK_ERROR_FEATURE_NOT_PRESENT"
+        ));
+        return Err(VK_ERROR_FEATURE_NOT_PRESENT);
     }
     let mut s = Box::new(StrippedDeviceInfo { info: rd(info, 0), features: [0; FEATURE_COUNT], features2: [0; 240] });
     if via_features {
@@ -459,19 +608,13 @@ pub fn strip_device_features(pd: *mut c_void, info: *const c_void) -> Option<Box
         s.info[64..72].copy_from_slice(&p.to_ne_bytes());
     }
     if via_features2 {
-        if f2 != head {
-            unhandled(format_args!(
-                "vkCreateDevice: VkPhysicalDeviceFeatures2 is not the first pNext node; textureCompressionETC2 left enabled"
-            ));
-        } else {
-            s.features2 = rd(f2, 0);
-            s.features2[16 + FEATURE_ETC2 * 4..16 + FEATURE_ETC2 * 4 + 4].copy_from_slice(&0u32.to_ne_bytes());
-            let p = s.features2.as_ptr() as usize;
-            s.info[8..16].copy_from_slice(&p.to_ne_bytes());
-        }
+        s.features2 = rd(f2, 0);
+        s.features2[16 + FEATURE_ETC2 * 4..16 + FEATURE_ETC2 * 4 + 4].copy_from_slice(&0u32.to_ne_bytes());
+        let p = s.features2.as_ptr() as usize;
+        s.info[8..16].copy_from_slice(&p.to_ne_bytes());
     }
     trace(format_args!("vkCreateDevice: textureCompressionETC2 stripped before the host driver sees it"));
-    Some(s)
+    Ok(Some(s))
 }
 
 struct Dev {
@@ -489,14 +632,24 @@ struct Dev {
 
 static DEV: AtomicPtr<Dev> = AtomicPtr::new(std::ptr::null_mut());
 
-pub fn device_created(pd: *mut c_void, device: *mut c_void) {
+pub fn device_created(pd: *mut c_void, device: *mut c_void, alloc: *const c_void) -> i32 {
     if !emulate_for(pd) {
-        return;
+        return VK_SUCCESS;
+    }
+    let fail = |why: &str| {
+        refused(format_args!("device {device:p}: {why}; destroying it and failing vkCreateDevice"));
+        let destroy = super::vulkan::host_instance_proc(c"vkDestroyDevice") as usize;
+        if let Some(destroy) = as_fn::<extern "C" fn(*mut c_void, *const c_void)>(destroy) {
+            destroy(device, alloc);
+        }
+        VK_ERROR_INITIALIZATION_FAILED
+    };
+    if !DEV.load(Acquire).is_null() {
+        return fail("another device is already emulating ETC2/EAC and only one at a time is supported");
     }
     let gdpa = super::vulkan::host_instance_proc(c"vkGetDeviceProcAddr");
     let Some(gdpa) = as_fn::<extern "C" fn(*mut c_void, *const c_char) -> *mut c_void>(gdpa as usize) else {
-        unhandled(format_args!("no host vkGetDeviceProcAddr; ETC uploads cannot be decoded"));
-        return;
+        return fail("no host vkGetDeviceProcAddr, so ETC uploads could not be decoded");
     };
     let get = |n: &CStr| gdpa(device, n.as_ptr()) as usize;
     let memprops = super::vulkan::host_instance_proc(c"vkGetPhysicalDeviceMemoryProperties") as usize;
@@ -523,17 +676,17 @@ pub fn device_created(pd: *mut c_void, device: *mut c_void) {
             memory_types,
         })
     })();
-    match dev {
-        Some(d) => {
-            trace(format_args!(
-                "device {device:p}: ETC2/EAC emulation active ({} memory types)",
-                d.memory_types.len()
-            ));
-            forget_device();
-            DEV.store(Box::into_raw(Box::new(d)), Release);
-        }
-        None => unhandled(format_args!("device {device:p}: could not resolve the host calls staging needs")),
+    let Some(d) = dev else {
+        return fail("could not resolve the host calls staging needs");
+    };
+    let n = d.memory_types.len();
+    let p = Box::into_raw(Box::new(d));
+    if DEV.compare_exchange(std::ptr::null_mut(), p, Release, Relaxed).is_err() {
+        drop(unsafe { Box::from_raw(p) });
+        return fail("another device started emulating ETC2/EAC concurrently and only one at a time is supported");
     }
+    trace(format_args!("device {device:p}: ETC2/EAC emulation active ({n} memory types)"));
+    VK_SUCCESS
 }
 
 fn active() -> Option<&'static Dev> {
@@ -617,6 +770,7 @@ struct Job {
 struct CmdState {
     chunks: Vec<Chunk>,
     pending: Vec<Pending>,
+    next_chunk: u64,
 }
 
 #[derive(Default)]
@@ -634,6 +788,7 @@ fn state() -> MutexGuard<'static, State> {
 }
 
 static LIVE_CMDS: AtomicUsize = AtomicUsize::new(0);
+static LIVE_STAGING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DECODE_US: AtomicUsize = AtomicUsize::new(0);
 static LIVE_IMAGES: AtomicUsize = AtomicUsize::new(0);
 
@@ -674,12 +829,14 @@ extern "C" fn create_image(device: *mut c_void, info: *const c_void, alloc: *con
     if !image_request_ok(tiling, usage, flags) {
         unhandled(format_args!("vkCreateImage({describe}): usage/tiling/flags beyond what is advertised"));
     }
-    if !chain_find(rd::<*const c_void>(info, 8), ST_IMAGE_FORMAT_LIST_CREATE_INFO).is_null() {
-        unhandled(format_args!("vkCreateImage({describe}): VkImageFormatListCreateInfo is forwarded unchanged"));
-    }
-    let mut copy: [u8; 88] = rd(info, 0);
-    copy[24..28].copy_from_slice(&sub.to_ne_bytes());
-    let rc = f(device, copy.as_ptr() as *const c_void, alloc, out);
+    let copy = match substitute_image_info(info, sub) {
+        Ok(c) => c,
+        Err(e) => {
+            refused(format_args!("vkCreateImage({describe}): {e}; failing with VK_ERROR_FORMAT_NOT_SUPPORTED"));
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        }
+    };
+    let rc = f(device, copy.as_ptr(), alloc, out);
     if rc == VK_SUCCESS && !out.is_null() {
         let image: u64 = rd(out as *const c_void, 0);
         state().images.insert(
@@ -693,6 +850,117 @@ extern "C" fn create_image(device: *mut c_void, info: *const c_void, alloc: *con
         trace(format_args!("vkCreateImage({describe}): substitute format {sub} FAILED rc={rc}"));
     }
     rc
+}
+
+struct SubstitutedImageInfo {
+    info: [u8; 88],
+    list: [u8; 32],
+    formats: Vec<u32>,
+}
+
+impl SubstitutedImageInfo {
+    fn as_ptr(&self) -> *const c_void {
+        self.info.as_ptr() as *const c_void
+    }
+}
+
+fn substitute_image_info(info: *const c_void, sub: u32) -> Result<Box<SubstitutedImageInfo>, String> {
+    let mut s = Box::new(SubstitutedImageInfo { info: rd(info, 0), list: [0; 32], formats: Vec::new() });
+    s.info[24..28].copy_from_slice(&sub.to_ne_bytes());
+    let head: *const c_void = rd(info, 8);
+    let list = chain_find(head, ST_IMAGE_FORMAT_LIST_CREATE_INFO);
+    if list.is_null() {
+        return Ok(s);
+    }
+    let count: u32 = rd(list, 16);
+    let formats: *const c_void = rd(list, 24);
+    let listed: Vec<u32> =
+        if formats.is_null() { Vec::new() } else { (0..count as usize).map(|i| rd(formats, i * 4)).collect() };
+    if !listed.iter().any(|&f| etc_format(f).is_some()) {
+        return Ok(s);
+    }
+    if list != head {
+        return Err("VkImageFormatListCreateInfo names an ETC format but is not the first pNext node".into());
+    }
+    s.formats = listed.iter().map(|&f| etc_format(f).map_or(f, |(_, sub, _)| sub)).collect();
+    s.list = rd(list, 0);
+    let p = s.formats.as_ptr() as usize;
+    s.list[24..32].copy_from_slice(&p.to_ne_bytes());
+    let p = s.list.as_ptr() as usize;
+    s.info[8..16].copy_from_slice(&p.to_ne_bytes());
+    trace(format_args!("VkImageFormatListCreateInfo {listed:?} rewritten to {:?}", s.formats));
+    Ok(s)
+}
+
+enum DeviceImage {
+    Forward,
+    Substituted([u8; 32], Box<SubstitutedImageInfo>),
+    Refused,
+}
+
+fn device_image_info(device: *mut c_void, info: *const c_void, via: &str) -> DeviceImage {
+    if info.is_null() || active_device(device as usize).is_none() {
+        return DeviceImage::Forward;
+    }
+    let create: *const c_void = rd(info, 16);
+    if create.is_null() {
+        return DeviceImage::Forward;
+    }
+    let format: u32 = rd(create, 24);
+    let Some((_, sub, name)) = etc_format(format) else {
+        return DeviceImage::Forward;
+    };
+    match substitute_image_info(create, sub) {
+        Ok(image) => {
+            let mut outer: [u8; 32] = rd(info, 0);
+            let p = image.as_ptr() as usize;
+            outer[16..24].copy_from_slice(&p.to_ne_bytes());
+            trace(format_args!("{via}({name}): asked of substitute format {sub}"));
+            DeviceImage::Substituted(outer, image)
+        }
+        Err(e) => {
+            refused(format_args!("{via}({name}): {e}; answered with nothing"));
+            DeviceImage::Refused
+        }
+    }
+}
+
+extern "C" fn device_image_memory_requirements(device: *mut c_void, info: *const c_void, out: *mut c_void) {
+    let Some(f) = as_fn::<extern "C" fn(*mut c_void, *const c_void, *mut c_void)>(H_DEVICE_IMAGE_MEM_REQS.load(Relaxed))
+    else {
+        return;
+    };
+    match device_image_info(device, info, "vkGetDeviceImageMemoryRequirements") {
+        DeviceImage::Forward => f(device, info, out),
+        DeviceImage::Substituted(outer, _image) => f(device, outer.as_ptr() as *const c_void, out),
+        DeviceImage::Refused => {
+            if !out.is_null() {
+                wr::<[u64; 3]>(out, 16, [0, 0, 0]);
+            }
+        }
+    }
+}
+
+extern "C" fn device_image_sparse_memory_requirements(
+    device: *mut c_void,
+    info: *const c_void,
+    count: *mut u32,
+    out: *mut c_void,
+) {
+    let Some(f) = as_fn::<extern "C" fn(*mut c_void, *const c_void, *mut u32, *mut c_void)>(
+        H_DEVICE_IMAGE_SPARSE_MEM_REQS.load(Relaxed),
+    ) else {
+        return;
+    };
+    match device_image_info(device, info, "vkGetDeviceImageSparseMemoryRequirements") {
+        DeviceImage::Forward => f(device, info, count, out),
+        DeviceImage::Substituted(outer, _image) => f(device, outer.as_ptr() as *const c_void, count, out),
+        DeviceImage::Refused => {
+            if !count.is_null() {
+                wr::<u32>(count as *mut c_void, 0, 0);
+            }
+        }
+    }
 }
 
 extern "C" fn destroy_image(device: *mut c_void, image: u64, alloc: *const c_void) {
@@ -740,11 +1008,13 @@ extern "C" fn create_image_view(device: *mut c_void, info: *const c_void, alloc:
 
 fn hash(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ data.len() as u64;
-    let (words, rest) = data.as_chunks::<8>();
-    for c in words {
-        h = (h ^ u64::from_le_bytes(*c)).wrapping_mul(0x0100_0000_01b3).rotate_left(29);
+    let whole = data.len() / 8 * 8;
+    for i in (0..whole).step_by(8) {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&data[i..i + 8]);
+        h = (h ^ u64::from_le_bytes(w)).wrapping_mul(0x0100_0000_01b3).rotate_left(29);
     }
-    for &b in rest {
+    for &b in &data[whole..] {
         h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
     }
     h
@@ -812,14 +1082,16 @@ fn source_bytes(
 }
 
 fn staging(dev: &Dev, cmd: &mut CmdState, len: u64) -> Result<(u64, u64, usize), String> {
-    if let Some(c) = cmd.chunks.last_mut() {
+    for c in cmd.chunks.iter_mut() {
         let at = c.used.div_ceil(STAGING_ALIGN) * STAGING_ALIGN;
         if at + len <= c.size {
             c.used = at + len;
             return Ok((c.buffer, at, c.mapped + at as usize));
         }
     }
-    let size = len.max(STAGING_CHUNK);
+    let want = if cmd.next_chunk == 0 { STAGING_FIRST } else { cmd.next_chunk };
+    let size = len.max(want).div_ceil(STAGING_GRANULE) * STAGING_GRANULE;
+    cmd.next_chunk = (want * 2).min(STAGING_CAP);
     let mut bci = [0u8; 56];
     bci[0..4].copy_from_slice(&ST_BUFFER_CREATE_INFO.to_ne_bytes());
     bci[24..32].copy_from_slice(&size.to_ne_bytes());
@@ -863,6 +1135,9 @@ fn staging(dev: &Dev, cmd: &mut CmdState, len: u64) -> Result<(u64, u64, usize),
         return Err(format!("staging bind rc={rc_bind} map rc={rc_map}"));
     }
     cmd.chunks.push(Chunk { buffer, memory, mapped: mapped as usize, size, used: len });
+    let live = LIVE_STAGING.fetch_add(size, Relaxed) + size;
+    glcount::ETC_STAGING_PEAK_KIB.fetch_max(live / 1024, Relaxed);
+    glcount::ETC_STAGING_CHUNKS.fetch_add(1, Relaxed);
     Ok((buffer, 0, mapped as usize))
 }
 
@@ -870,6 +1145,7 @@ fn release_cmd(dev: &Dev, cmd: CmdState) {
     for c in cmd.chunks {
         (dev.destroy_buffer)(dev.device, c.buffer, std::ptr::null());
         (dev.free_memory)(dev.device, c.memory, std::ptr::null());
+        LIVE_STAGING.fetch_sub(c.size, Relaxed);
     }
 }
 
@@ -892,12 +1168,16 @@ fn release_cmds(cmds: &[usize]) {
     }
     LIVE_CMDS.fetch_sub(released.len(), Relaxed);
     let bytes: u64 = released.iter().flat_map(|c| c.chunks.iter()).map(|c| c.size).sum();
+    let used: u64 = released.iter().flat_map(|c| c.chunks.iter()).map(|c| c.used).sum();
+    let chunks: usize = released.iter().map(|c| c.chunks.len()).sum();
     let regions: usize = released.iter().map(|c| c.pending.len()).sum();
     trace(format_args!(
-        "staging released: {} command buffer(s), {regions} region(s), {} KiB; {} still holding staging",
+        "staging released: {} command buffer(s), {regions} region(s), {} KiB in {chunks} chunk(s) of which {} KiB used; {} still holding staging; peak {} KiB",
         released.len(),
         bytes / 1024,
-        LIVE_CMDS.load(Relaxed)
+        used / 1024,
+        LIVE_CMDS.load(Relaxed),
+        glcount::ETC_STAGING_PEAK_KIB.load(Relaxed)
     ));
     for s in released {
         release_cmd(dev, s);
@@ -943,36 +1223,44 @@ fn emulate_copy(
     let src_len = (layers - 1) * layer_stride + last_layer;
     let dst_len = w * h * layers * fmt.texel_bytes();
 
-    let mut guard = state();
-    let st = &mut *guard;
-    let &(memory, bind_offset) =
-        st.buffers.get(&src_buffer).ok_or_else(|| format!("source buffer 0x{src_buffer:x} has no recorded binding"))?;
-    let mem_offset = bind_offset + region.buffer_offset;
-    let entry = st.cmds.entry(cmd as usize).or_insert_with(|| {
-        LIVE_CMDS.fetch_add(1, Relaxed);
-        CmdState::default()
-    });
-    let (buffer, offset, dst) = staging(dev, entry, dst_len as u64)?;
-    let job = Job { format: fmt, row_blocks, rows_of_blocks, layer_stride, layers, width: w, height: h, dst, dst_len };
-    let note;
-    let (decoded, h64, note) = match source_bytes(&st.mapped, memory, mem_offset, src_len) {
-        Ok(bytes) => {
-            let t = std::time::Instant::now();
-            let hv = hash(bytes);
-            run_job(&job, bytes)?;
-            let us = t.elapsed().as_micros() as u64;
-            DECODE_US.fetch_add(us as usize, Relaxed);
-            note = format!("decoded at record in {us} us ({} ms total)", DECODE_US.load(Relaxed) / 1000);
-            (true, hv, note.as_str())
-        }
-        Err(e) => {
-            slice_mut(dst as *mut c_void, dst_len).fill(0);
-            unhandled(format_args!("source not readable at record time ({e}); will retry at submit"));
-            (false, 0, "deferred to submit")
-        }
+    let (memory, mem_offset, source, mut entry) = {
+        let mut st = state();
+        let &(memory, bind_offset) = st
+            .buffers
+            .get(&src_buffer)
+            .ok_or_else(|| format!("source buffer 0x{src_buffer:x} has no recorded binding"))?;
+        let mem_offset = bind_offset + region.buffer_offset;
+        let source = source_bytes(&st.mapped, memory, mem_offset, src_len);
+        let entry = st.cmds.remove(&(cmd as usize)).unwrap_or_else(|| {
+            LIVE_CMDS.fetch_add(1, Relaxed);
+            CmdState::default()
+        });
+        (memory, mem_offset, source, entry)
     };
-    entry.pending.push(Pending { memory, mem_offset, len: src_len, hash: h64, decoded, job });
-    drop(guard);
+    let recorded = (|| {
+        let (buffer, offset, dst) = staging(dev, &mut entry, dst_len as u64)?;
+        let job =
+            Job { format: fmt, row_blocks, rows_of_blocks, layer_stride, layers, width: w, height: h, dst, dst_len };
+        let (decoded, h64, note) = match source {
+            Ok(bytes) => {
+                let t = std::time::Instant::now();
+                let hv = hash(bytes);
+                run_job(&job, bytes)?;
+                let us = t.elapsed().as_micros() as u64;
+                DECODE_US.fetch_add(us as usize, Relaxed);
+                (true, hv, format!("decoded at record in {us} us ({} ms total)", DECODE_US.load(Relaxed) / 1000))
+            }
+            Err(e) => {
+                slice_mut(dst as *mut c_void, dst_len).fill(0);
+                unhandled(format_args!("source not readable at record time ({e}); will retry at submit"));
+                (false, 0, "deferred to submit".to_string())
+            }
+        };
+        entry.pending.push(Pending { memory, mem_offset, len: src_len, hash: h64, decoded, job });
+        Ok::<_, String>((buffer, offset, note))
+    })();
+    state().cmds.insert(cmd as usize, entry);
+    let (buffer, offset, note) = recorded?;
     let out = BufferImageCopy { buffer_offset: offset, buffer_row_length: 0, buffer_image_height: 0, ..*region };
     (dev.copy_buffer_to_image)(cmd, buffer, image, layout, 1, &out as *const BufferImageCopy as *const c_void);
     glcount::ETC_REGION_DECODED.fetch_add(1, Relaxed);
@@ -1288,13 +1576,20 @@ fn check_pending(cmds: impl Iterator<Item = usize>) {
     if LIVE_CMDS.load(Relaxed) == 0 {
         return;
     }
-    let mut st = state();
-    let st = &mut *st;
+    let mut work = Vec::new();
+    {
+        let mut st = state();
+        for c in cmds {
+            let Some(cs) = st.cmds.remove(&c) else { continue };
+            let sources: Vec<Result<&'static [u8], String>> =
+                cs.pending.iter().map(|p| source_bytes(&st.mapped, p.memory, p.mem_offset, p.len)).collect();
+            work.push((c, cs, sources));
+        }
+    }
     let (mut same, mut gone) = (0usize, 0usize);
-    for c in cmds {
-        let Some(cs) = st.cmds.get_mut(&c) else { continue };
-        for p in &mut cs.pending {
-            let bytes = match source_bytes(&st.mapped, p.memory, p.mem_offset, p.len) {
+    for (_, cs, sources) in &mut work {
+        for (p, source) in cs.pending.iter_mut().zip(sources.drain(..)) {
+            let bytes = match source {
                 Ok(b) => b,
                 Err(e) => {
                     gone += 1;
@@ -1327,6 +1622,12 @@ fn check_pending(cmds: impl Iterator<Item = usize>) {
                 }
                 Err(e) => unhandled(format_args!("submit: decode failed: {e}")),
             }
+        }
+    }
+    {
+        let mut st = state();
+        for (c, cs, _) in work {
+            st.cmds.insert(c, cs);
         }
     }
     if same + gone > 0 {
@@ -1528,6 +1829,54 @@ mod tests {
             .unwrap();
         }
         assert!(banded == single);
+    }
+
+    fn image_info(next: *const c_void, format: u32) -> [u8; 88] {
+        let mut info = [0u8; 88];
+        info[0..4].copy_from_slice(&14u32.to_ne_bytes());
+        info[8..16].copy_from_slice(&(next as usize).to_ne_bytes());
+        info[24..28].copy_from_slice(&format.to_ne_bytes());
+        info
+    }
+
+    fn format_list(next: *const c_void, formats: &[u32]) -> [u8; 32] {
+        let mut list = [0u8; 32];
+        list[0..4].copy_from_slice(&ST_IMAGE_FORMAT_LIST_CREATE_INFO.to_ne_bytes());
+        list[8..16].copy_from_slice(&(next as usize).to_ne_bytes());
+        list[16..20].copy_from_slice(&(formats.len() as u32).to_ne_bytes());
+        list[24..32].copy_from_slice(&(formats.as_ptr() as usize).to_ne_bytes());
+        list
+    }
+
+    #[test]
+    fn no_etc_format_reaches_the_driver_through_a_format_list() {
+        let formats = [147u32, 148];
+        let tail = [0u8; 24];
+        let list = format_list(tail.as_ptr() as *const c_void, &formats);
+        let info = image_info(list.as_ptr() as *const c_void, 147);
+        let s = substitute_image_info(info.as_ptr() as *const c_void, 37).unwrap();
+        assert_eq!(rd::<u32>(s.as_ptr(), 24), 37);
+        let new_list: *const c_void = rd(s.as_ptr(), 8);
+        assert_eq!(new_list, s.list.as_ptr() as *const c_void);
+        assert_eq!(rd::<*const c_void>(new_list, 8), tail.as_ptr() as *const c_void);
+        let p: *const c_void = rd(new_list, 24);
+        assert_eq!([rd::<u32>(p, 0), rd::<u32>(p, 4)], [37, 43]);
+        assert_eq!(formats, [147, 148]);
+    }
+
+    #[test]
+    fn a_format_list_that_cannot_be_rewritten_is_refused() {
+        let formats = [147u32];
+        let list = format_list(std::ptr::null(), &formats);
+        let mut other = [0u8; 24];
+        other[8..16].copy_from_slice(&(list.as_ptr() as usize).to_ne_bytes());
+        let info = image_info(other.as_ptr() as *const c_void, 147);
+        assert!(substitute_image_info(info.as_ptr() as *const c_void, 37).is_err());
+        let unrelated = [37u32];
+        let list = format_list(std::ptr::null(), &unrelated);
+        other[8..16].copy_from_slice(&(list.as_ptr() as usize).to_ne_bytes());
+        let s = substitute_image_info(info.as_ptr() as *const c_void, 37).unwrap();
+        assert_eq!(rd::<*const c_void>(s.as_ptr(), 8), other.as_ptr() as *const c_void);
     }
 
     #[test]

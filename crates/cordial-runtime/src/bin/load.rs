@@ -186,6 +186,10 @@ env:
                                      CPU; the engine then sees ETC1 0 ETC2 0.
                                      The control for docs/adr/ADR-048-etc2-is-
                                      emulated-where-the-driver-lacks-it.md
+  CORDIAL_FORCE_ETC_EMULATION=1      emulate ETC2/EAC even on a GPU that has it
+                                     natively, to compare native against
+                                     decoded. Test-only; off by default, and
+                                     CORDIAL_NO_ETC_EMULATION wins over it
   CORDIAL_FORCE_GPU_VENDOR=0x10de[@550.163.01]
                                      behave as though the GPU were NVIDIA's (or
                                      as another vendor id) for the code that is

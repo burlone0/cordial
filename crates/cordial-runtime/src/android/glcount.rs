@@ -62,6 +62,8 @@ counters! {
     ETC_REGION_DECODED       => "vkCmdCopyBufferToImage(ETC2/EAC regions decoded)",
     ETC_LATE_WRITE           => "  ...re-decoded at submit (source changed after recording)",
     ETC_UNHANDLED            => "ETC2/EAC emulation: unhandled calls (see trace)",
+    ETC_STAGING_CHUNKS       => "ETC2/EAC staging buffers allocated",
+    ETC_STAGING_PEAK_KIB     => "  ...peak live staging (KiB)",
 }
 
 /// The host implementation behind `sym`, looked up.

@@ -538,9 +538,13 @@ extern "C" fn vk_get_instance_proc_addr(instance: *mut c_void, name: *const c_ch
         // `VkInstance`: see `vk_create_instance`.
         _ => {
             let p = unsafe { (h.get_instance_proc_addr)(instance, name) };
-            super::vulkan_etc::hook(bytes, p).unwrap_or(p)
+            super::vulkan_etc::hook(None, bytes, p).unwrap_or(p)
         }
     }
+}
+
+pub(super) fn instance() -> *mut c_void {
+    INSTANCE.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void
 }
 
 pub(super) fn host_instance_proc(name: &CStr) -> *mut c_void {
@@ -583,7 +587,7 @@ extern "C" fn vk_get_device_proc_addr(device: *mut c_void, name: *const c_char) 
         }
         _ => {
             let p = host(device, name);
-            super::vulkan_etc::hook(bytes, p).unwrap_or(p)
+            super::vulkan_etc::hook(Some(device), bytes, p).unwrap_or(p)
         }
     }
 }
@@ -864,11 +868,18 @@ extern "C" fn vk_create_device(
     // SAFETY: resolved from the host loader for exactly this name, and called
     // with the caller's own arguments unchanged.
     let f: Fn_ = unsafe { std::mem::transmute(f) };
-    let stripped = super::vulkan_etc::strip_device_features(physical_device, create_info);
+    let stripped = match super::vulkan_etc::strip_device_features(physical_device, create_info) {
+        Ok(s) => s,
+        Err(rc) => return rc,
+    };
     let info = stripped.as_ref().map_or(create_info, |s| s.as_ptr());
     let rc = f(physical_device, info, allocator, device_out);
     if rc == VK_SUCCESS && !device_out.is_null() {
-        super::vulkan_etc::device_created(physical_device, unsafe { *device_out });
+        let emulated = super::vulkan_etc::device_created(physical_device, unsafe { *device_out }, allocator);
+        if emulated != VK_SUCCESS {
+            unsafe { *device_out = std::ptr::null_mut() };
+            return emulated;
+        }
     }
     rc
 }
