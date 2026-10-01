@@ -906,7 +906,8 @@ pub fn collect() -> Vec<Layer> {
             println!("  plugins: {id} is switched off; its flags.json is not read");
             continue;
         }
-        let path = root.join(&id).join("flags.json");
+        let shipped = root.join(&id).join("flags.json");
+        let path = if shipped.is_file() { shipped } else { plugin_dir().join(&id).join("flags.json") };
         if let Some(layer) = read_layer(&path, Source::Plugin(id)) {
             layers.push(layer);
         }
